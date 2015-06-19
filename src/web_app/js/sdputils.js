@@ -23,10 +23,9 @@ function mergeConstraints(cons1, cons2) {
     return cons1 || cons2;
   }
   var merged = cons1;
-  for (var name in cons2.mandatory) {
-    merged.mandatory[name] = cons2.mandatory[name];
+  for (var name in cons2) {
+    merged[name] = cons2[name];
   }
-  merged.optional = merged.optional.concat(cons2.optional);
   return merged;
 }
 

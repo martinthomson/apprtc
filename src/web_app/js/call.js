@@ -317,7 +317,7 @@ Call.prototype.connectToRoom_ = function(roomId) {
     // and have media and TURN. Since we send candidates as soon as the peer
     // connection generates them we need to wait for the signaling channel to be
     // ready.
-    Promise.all([this.getTurnServersPromise_, this.getMediaPromise_])
+    this.getTurnServersPromise_
         .then(function() {
           this.startSignaling_();
           if (isChromeApp()) {
@@ -345,15 +345,21 @@ Call.prototype.maybeGetMedia_ = function() {
   if (needStream) {
     var mediaConstraints = this.params_.mediaConstraints;
 
-    mediaPromise = requestUserMedia(mediaConstraints).then(function(stream) {
-      trace('Got access to local media with mediaConstraints:\n' +
-          '  \'' + JSON.stringify(mediaConstraints) + '\'');
+    this.maybeCreatePcClient_();
 
-      this.onUserMediaSuccess_(stream);
-    }.bind(this)).catch(function(error) {
-      this.onError_('Error getting user media: ' + error.message);
-      this.onUserMediaError_(error);
-    }.bind(this));
+    mediaPromise = this.pcClient_.getPeerIdentity()
+      .then(identity => mediaConstraints.peerIdentity = identity.name,
+            error => this.onError_('Failed to get identity: ' + error.message))
+      .then(_ => requestUserMedia(mediaConstraints))
+      .then(stream => {
+        trace('Got access to local media with mediaConstraints:\n' +
+              '  \'' + JSON.stringify(mediaConstraints) + '\'');
+
+        this.onUserMediaSuccess_(stream);
+      }, error => {
+        this.onError_('Error getting user media: ' + error.message);
+        this.onUserMediaError_(error);
+      });
   } else {
     mediaPromise = Promise.resolve();
   }
@@ -399,6 +405,10 @@ Call.prototype.onUserMediaSuccess_ = function(stream) {
   if (this.onlocalstreamadded) {
     this.onlocalstreamadded(stream);
   }
+
+  trace('Adding local stream.');
+  this.maybeCreatePcClient_();
+  this.pcClient_.addStream(this.localStream_);
 };
 
 Call.prototype.onUserMediaError_ = function(error) {
@@ -445,7 +455,7 @@ Call.prototype.startSignaling_ = function() {
     this.pcClient_.addStream(this.localStream_);
   }
   if (this.params_.isInitiator) {
-    this.pcClient_.startAsCaller(this.params_.offerConstraints);
+    this.pcClient_.startAsCaller();
   } else {
     this.pcClient_.startAsCallee(this.params_.messages);
   }

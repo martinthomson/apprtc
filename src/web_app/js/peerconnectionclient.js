@@ -31,13 +31,15 @@ var PeerConnectionClient = function(params, startTime) {
 
   // Create an RTCPeerConnection via the polyfill (adapter.js).
   this.pc_ = new RTCPeerConnection(
-      params.peerConnectionConfig, params.peerConnectionConstraints);
+    params.peerConnectionConfig, params.peerConnectionConstraints);
+  this.pc_.setIdentityProvider('martinthomson.github.io', 'idp.js');
   this.pc_.onicecandidate = this.onIceCandidate_.bind(this);
   this.pc_.onaddstream = this.onRemoteStreamAdded_.bind(this);
   this.pc_.onremovestream = trace.bind(null, 'Remote stream removed.');
   this.pc_.onsignalingstatechange = this.onSignalingStateChanged_.bind(this);
   this.pc_.oniceconnectionstatechange =
-      this.onIceConnectionStateChanged_.bind(this);
+    this.onIceConnectionStateChanged_.bind(this);
+  this.pc_.onnegotiationneeded = e => this.createOffer_(this);
 
   this.hasRemoteSdp_ = false;
   this.messageQueue_ = [];
@@ -59,13 +61,9 @@ var PeerConnectionClient = function(params, startTime) {
 // Set up audio and video regardless of what devices are present.
 // Disable comfort noise for maximum audio quality.
 PeerConnectionClient.DEFAULT_SDP_CONSTRAINTS_ = {
-  'mandatory': {
-    'OfferToReceiveAudio': true,
-    'OfferToReceiveVideo': true
-  },
-  'optional': [{
-    'VoiceActivityDetection': false
-  }]
+  offerToReceiveAudio: true,
+  offerToReceiveVideo: true,
+  voiceActivityDetection: false
 };
 
 PeerConnectionClient.prototype.addStream = function(stream) {
@@ -75,7 +73,7 @@ PeerConnectionClient.prototype.addStream = function(stream) {
   this.pc_.addStream(stream);
 };
 
-PeerConnectionClient.prototype.startAsCaller = function(offerConstraints) {
+PeerConnectionClient.prototype.startAsCaller = function() {
   if (!this.pc_) {
     return false;
   }
@@ -86,14 +84,26 @@ PeerConnectionClient.prototype.startAsCaller = function(offerConstraints) {
 
   this.isInitiator_ = true;
   this.started_ = true;
+  // Always request data channels, so that we can connect without media.
+  // This also triggers onnegotiationneeded and therefore createOffer_()..
+  this.dc_ = this.pc_.createDataChannel('dummy');
+  return true;
+};
+
+// Run by the initiator when starting, AND when onnegotiationneeded fires.
+PeerConnectionClient.prototype.createOffer_ = function() {
+  if (this.pc_.signalingState !== 'stable') {
+    return false;
+  }
+
   var constraints = mergeConstraints(
-      offerConstraints, PeerConnectionClient.DEFAULT_SDP_CONSTRAINTS_);
+    this.params_.offerConstraints,
+    PeerConnectionClient.DEFAULT_SDP_CONSTRAINTS_);
   trace('Sending offer to peer, with constraints: \n\'' +
       JSON.stringify(constraints) + '\'.');
-  this.pc_.createOffer(this.setLocalSdpAndNotify_.bind(this),
-      this.onError_.bind(this, 'createOffer'),
-      constraints);
-
+  this.pc_.createOffer(constraints)
+    .then(offer => this.setLocalSdpAndNotify_(offer),
+          error => this.onError_(error));
   return true;
 };
 
@@ -120,9 +130,7 @@ PeerConnectionClient.prototype.startAsCallee = function(initialMessages) {
 
   // We may have queued messages received from the signaling channel before
   // started.
-  if (this.messageQueue_.length > 0) {
-    this.drainMessageQueue_();
-  }
+  this.drainMessageQueue_();
   return true;
 };
 
@@ -131,9 +139,8 @@ PeerConnectionClient.prototype.receiveSignalingMessage = function(message) {
   if (!messageObj) {
     return;
   }
-  if ((this.isInitiator_ && messageObj.type === 'answer') ||
-      (!this.isInitiator_ && messageObj.type === 'offer')) {
-    this.hasRemoteSdp_ = true;
+  trace('received message: ' + messageObj.type);
+  if (messageObj.type === 'answer' || messageObj.type === 'offer') {
     // Always process offer before candidates.
     this.messageQueue_.unshift(messageObj);
   } else if (messageObj.type === 'candidate') {
@@ -169,7 +176,14 @@ PeerConnectionClient.prototype.getPeerConnectionStats = function(callback) {
   if (!this.pc_) {
     return;
   }
-  this.pc_.getStats(callback);
+  this.pc_.getStats().then(callback, error => this.onError_(error));
+};
+
+PeerConnectionClient.prototype.getPeerIdentity = function() {
+  if (!this.pc_) {
+    return;
+  }
+  return this.pc_.peerIdentity;
 };
 
 PeerConnectionClient.prototype.doAnswer_ = function() {
@@ -180,7 +194,8 @@ PeerConnectionClient.prototype.doAnswer_ = function() {
 };
 
 PeerConnectionClient.prototype.setLocalSdpAndNotify_ =
-    function(sessionDescription) {
+  function(sessionDescription) {
+  trace('Setting local ' + sessionDescription.type + ':\n' + sessionDescription.sdp);
   sessionDescription.sdp = maybePreferAudioReceiveCodec(
     sessionDescription.sdp,
     this.params_);
@@ -199,9 +214,9 @@ PeerConnectionClient.prototype.setLocalSdpAndNotify_ =
 
   if (this.onsignalingmessage) {
     // Chrome version of RTCSessionDescription can't be serialized directly
-    // because it JSON.stringify won't include attributes which are on the
-    // object's prototype chain. By creating the message to serialize explicitly
-    // we can avoid the issue.
+    // because JSON.stringify won't include attributes which are on the object's
+    // prototype chain. By creating the message to serialize explicitly we can
+    // avoid the issue.
     this.onsignalingmessage({
       sdp: sessionDescription.sdp,
       type: sessionDescription.type
@@ -216,9 +231,9 @@ PeerConnectionClient.prototype.setRemoteSdp_ = function(message) {
   message.sdp = maybeSetAudioSendBitRate(message.sdp, this.params_);
   message.sdp = maybeSetVideoSendBitRate(message.sdp, this.params_);
   message.sdp = maybeSetVideoSendInitialBitRate(message.sdp, this.params_);
-  this.pc_.setRemoteDescription(new RTCSessionDescription(message),
-      this.onSetRemoteDescriptionSuccess_.bind(this),
-      this.onError_.bind(this, 'setRemoteDescription'));
+  return this.pc_.setRemoteDescription(new RTCSessionDescription(message),
+                                       this.onSetRemoteDescriptionSuccess_.bind(this),
+                                       this.onError_.bind(this, 'setRemoteDescription'));
 };
 
 PeerConnectionClient.prototype.onSetRemoteDescriptionSuccess_ = function() {
@@ -234,15 +249,20 @@ PeerConnectionClient.prototype.onSetRemoteDescriptionSuccess_ = function() {
 };
 
 PeerConnectionClient.prototype.processSignalingMessage_ = function(message) {
-  if (message.type === 'offer' && !this.isInitiator_) {
+  if (message.type === 'offer') {
     if (this.pc_.signalingState !== 'stable') {
-      trace('ERROR: remote offer received in unexpected state: ' +
+      trace('NOTE: remote offer received in unexpected state: ' +
             this.pc_.signalingState);
-      return;
+      // We only use the initiator as a tie-breaker here.  If we have an offer
+      // outstanding, just forget it.
+      if (!this.isInitiator_) {
+        var rollback = new RTCSessionDescription({ type: 'rollback' });
+        this.setLocalDescription(rollback);
+      }
     }
     this.setRemoteSdp_(message);
     this.doAnswer_();
-  } else if (message.type === 'answer' && this.isInitiator_) {
+  } else if (message.type === 'answer') {
     if (this.pc_.signalingState !== 'have-local-offer') {
       trace('ERROR: remote answer received in unexpected state: ' +
             this.pc_.signalingState);
@@ -275,7 +295,7 @@ PeerConnectionClient.prototype.drainMessageQueue_ = function() {
   // some requests faster than others. We need to process offer before
   // candidates so we wait for the offer to arrive first if we're answering.
   // Offers are added to the front of the queue.
-  if (!this.pc_ || !this.started_ || !this.hasRemoteSdp_) {
+  if (!this.pc_ || !this.started_) {
     return;
   }
   for (var i = 0, len = this.messageQueue_.length; i < len; i++) {
